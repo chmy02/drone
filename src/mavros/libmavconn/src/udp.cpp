@@ -211,18 +211,14 @@ void MAVConnUDP::send_bytes(const uint8_t * bytes, size_t length)
   }
 
   {
-    chmy_thread_log("txq_mutex", "lock");
     lock_guard lock(mutex);
-    chmy_thread_log("txq_mutex", "lock");
 
     if (tx_q.size() >= MAX_TXQ_SIZE) {
       throw std::length_error("MAVConnUDP::send_bytes: TX queue overflow");
     }
 
     tx_q.emplace_back(bytes, length);
-    chmy_emplace_log(0, tx_q.size()); // 0은 bytes 전송의 경우
-    
-    chmy_thread_log("txq_mutex", "unlock");
+    chmy_emplace_log(0);
   }
   io_service.post(std::bind(&MAVConnUDP::do_sendto, shared_from_this(), true));
 }
@@ -244,18 +240,14 @@ void MAVConnUDP::send_message(const mavlink_message_t * message)
   log_send(PFX, message);
 
   {
-    chmy_thread_log("txq_mutex", "lock");
     lock_guard lock(mutex);
-    chmy_thread_log("txq_mutex", "lock");
 
     if (tx_q.size() >= MAX_TXQ_SIZE) {
       throw std::length_error("MAVConnUDP::send_message: TX queue overflow");
     }
 
     tx_q.emplace_back(message);
-    chmy_emplace_log(message->msgid, tx_q.size());
-    
-    chmy_thread_log("txq_mutex", "lock");
+    chmy_emplace_log(message->msgid);
   }
   io_service.post(std::bind(&MAVConnUDP::do_sendto, shared_from_this(), true));
 }
@@ -275,18 +267,14 @@ void MAVConnUDP::send_message(const mavlink::Message & message, const uint8_t so
   log_send_obj(PFX, message);
 
   {
-    chmy_thread_log("txq_mutex", "lock");
     lock_guard lock(mutex);
-    chmy_thread_log("txq_mutex", "lock");
 
     if (tx_q.size() >= MAX_TXQ_SIZE) {
       throw std::length_error("MAVConnUDP::send_message: TX queue overflow");
     }
 
     tx_q.emplace_back(message, get_status_p(), sys_id, source_compid);
-    chmy_emplace_log(0, tx_q.size()); // TODO: message ID 가져오는 방법 찾기
-    
-    chmy_thread_log("txq_mutex", "lock");
+    chmy_emplace_log(0);
   }
   io_service.post(std::bind(&MAVConnUDP::do_sendto, shared_from_this(), true));
 }
@@ -323,9 +311,7 @@ void MAVConnUDP::do_sendto(bool check_tx_state)
     return;
   }
 
-  chmy_thread_log("txq_mutex", "lock");
   lock_guard lock(mutex);
-  chmy_thread_log("txq_mutex", "lock");
   if (tx_q.empty()) {
     return;
   }
@@ -351,9 +337,7 @@ void MAVConnUDP::do_sendto(bool check_tx_state)
       }
 
       sthis->iostat_tx_add(bytes_transferred);
-      chmy_thread_log("txq_mutex", "lock");
       lock_guard lock(sthis->mutex);
-      chmy_thread_log("txq_mutex", "lock");
 
       if (sthis->tx_q.empty()) {
         sthis->tx_in_progress = false;
@@ -363,7 +347,7 @@ void MAVConnUDP::do_sendto(bool check_tx_state)
       buf_ref.pos += bytes_transferred;
       if (buf_ref.nbytes() == 0) {
         sthis->tx_q.pop_front();
-        chmy_popfront_log(0, sthis->tx_q.size()); // bytes 전송의 경우
+        chmy_pop_log();
       }
 
       if (!sthis->tx_q.empty()) {

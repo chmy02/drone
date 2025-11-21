@@ -15,6 +15,12 @@
  */
 
 #include <algorithm>
+#include <chrono>
+#include <fstream>
+#include <sstream>
+#include <iomanip>
+#include <mutex>
+#include <atomic>
 
 #include "tf2_eigen/tf2_eigen.hpp"
 #include "rcpputils/asserts.hpp"
@@ -56,6 +62,24 @@ public:
       "thrust_scaling", NAN, [&](const rclcpp::Parameter & p) {
         thrust_scaling = p.as_double();
       });
+
+    // Latency measurement log file
+    auto now = std::chrono::system_clock::now();
+    auto time_t = std::chrono::system_clock::to_time_t(now);
+    std::stringstream ss;
+    ss << "/home/rtcl-chmy/mavros_ws/src/mavros/chmy/logs/" << std::put_time(std::localtime(&time_t), "%Y%m%d_%H%M%S") << "_topic1_setpoint_raw_local_latency.log";
+    latency_log_file.open(ss.str(), std::ios::out | std::ios::app);
+    if (latency_log_file.is_open()) {
+      RCLCPP_INFO(get_logger(), "Latency log file opened: %s", ss.str().c_str());
+    }
+
+    // Attitude latency measurement log file
+    std::stringstream ss_att;
+    ss_att << "/home/rtcl-chmy/mavros_ws/src/mavros/chmy/logs/" << std::put_time(std::localtime(&time_t), "%Y%m%d_%H%M%S") << "_topic4_setpoint_raw_attitude_latency.log";
+    attitude_latency_log_file.open(ss_att.str(), std::ios::out | std::ios::app);
+    if (attitude_latency_log_file.is_open()) {
+      RCLCPP_INFO(get_logger(), "Attitude latency log file opened: %s", ss_att.str().c_str());
+    }
 
     auto sensor_qos = rclcpp::SensorDataQoS();
 
@@ -105,6 +129,15 @@ private:
   rclcpp::Publisher<mavros_msgs::msg::AttitudeTarget>::SharedPtr target_attitude_pub;
 
   double thrust_scaling;
+
+  // Latency measurement
+  std::ofstream latency_log_file;
+  std::mutex latency_log_mutex;
+  std::atomic<uint64_t> msg_count{0};
+
+  // Latency measurement for attitude
+  std::ofstream attitude_latency_log_file;
+  std::mutex attitude_latency_log_mutex;
 
   /* -*- message handlers -*- */
   void handle_position_target_local_ned(
@@ -199,10 +232,47 @@ private:
 
   void local_cb(const mavros_msgs::msg::PositionTarget::SharedPtr req)
   {
+    // Latency measurement: callback 시작 시각 (나노초)
+    // system_clock 사용 (Python의 time.time_ns()와 동일한 기준)
+    auto callback_start_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+      std::chrono::system_clock::now().time_since_epoch()).count();
+    
     using mavros_msgs::msg::PositionTarget;
 
     Eigen::Vector3d position, velocity, af;
     float yaw, yaw_rate;
+
+    // Parse timestamp from frame_id if available
+    // Format: "node_{node_id}_msg_{counter}_time_{publish_time_ns}"
+    uint64_t publish_time_ns = 0;
+    int node_id = 0;
+    uint64_t msg_counter = 0;
+    
+    if (req->header.frame_id.find("_time_") != std::string::npos) {
+      // Extract publish time from frame_id
+      try {
+        size_t time_pos = req->header.frame_id.find("_time_");
+        if (time_pos != std::string::npos) {
+          std::string time_str = req->header.frame_id.substr(time_pos + 6);
+          publish_time_ns = std::stoull(time_str);
+          
+          // Extract node_id and msg_counter
+          size_t node_pos = req->header.frame_id.find("node_");
+          size_t msg_pos = req->header.frame_id.find("_msg_");
+          if (node_pos != std::string::npos && msg_pos != std::string::npos) {
+            node_id = std::stoi(req->header.frame_id.substr(node_pos + 5, msg_pos - node_pos - 5));
+            size_t msg_end = req->header.frame_id.find("_time_");
+            if (msg_end != std::string::npos) {
+              msg_counter = std::stoull(req->header.frame_id.substr(msg_pos + 5, msg_end - msg_pos - 5));
+            }
+          }
+          
+          // Latency will be logged after send_message() completes (at t4)
+        }
+      } catch (const std::exception& e) {
+        // Ignore parsing errors
+      }
+    }
 
     tf2::fromMsg(req->position, position);
     tf2::fromMsg(req->velocity, velocity);
@@ -241,6 +311,33 @@ private:
       velocity,
       af,
       yaw, yaw_rate);
+    
+    // t4: send_message() 완료 시각 측정
+    auto send_complete_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+      std::chrono::system_clock::now().time_since_epoch()).count();
+    
+    // t3 → t4: MAVROS 내부 처리 시간
+    int64_t processing_latency_ns = send_complete_ns - callback_start_ns;
+    double processing_latency_us = processing_latency_ns / 1e3;  // 마이크로초
+    
+    // 로그 업데이트 (t4 추가)
+    if (publish_time_ns > 0) {
+      int64_t total_latency_ns = callback_start_ns - publish_time_ns;
+      double total_latency_us = total_latency_ns / 1e3;  // 마이크로초
+      
+      std::lock_guard<std::mutex> lock(latency_log_mutex);
+      if (latency_log_file.is_open()) {
+        latency_log_file << node_id << ","
+                         << msg_counter << ","
+                         << publish_time_ns << ","
+                         << callback_start_ns << ","
+                         << send_complete_ns << ","
+                         << processing_latency_ns << ","
+                         << processing_latency_us << ","
+                         << total_latency_ns << ","
+                         << total_latency_us << "\n";
+      }
+    }
   }
 
   void global_cb(const mavros_msgs::msg::GlobalPositionTarget::SharedPtr req)
@@ -276,6 +373,29 @@ private:
 
   void attitude_cb(const mavros_msgs::msg::AttitudeTarget::SharedPtr req)
   {
+    // Latency measurement: callback invocation time
+    auto callback_start_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+      std::chrono::system_clock::now().time_since_epoch()).count();
+
+    // Parse frame_id: "node_<id>_msg_<counter>_time_<publish_time_ns>"
+    std::string frame_id = req->header.frame_id;
+    int64_t publish_time_ns = 0;
+    int node_id = 0;
+    int msg_counter = 0;
+
+    size_t time_pos = frame_id.find("_time_");
+    if (time_pos != std::string::npos) {
+      publish_time_ns = std::stoll(frame_id.substr(time_pos + 6));
+      
+      size_t node_pos = frame_id.find("node_");
+      size_t msg_pos = frame_id.find("_msg_");
+      if (node_pos != std::string::npos && msg_pos != std::string::npos) {
+        node_id = std::stoi(frame_id.substr(node_pos + 5, msg_pos - node_pos - 5));
+        msg_counter = std::stoi(frame_id.substr(msg_pos + 5, time_pos - msg_pos - 5));
+      }
+      // Latency will be logged after send_message() completes (at t4)
+    }
+
     Eigen::Quaterniond desired_orientation;
     Eigen::Vector3d baselink_angular_rate;
     Eigen::Vector3d body_rate;
@@ -321,6 +441,33 @@ private:
         ned_desired_orientation,
         body_rate,
         thrust);
+      
+      // t4: send_message() 완료 시각 측정
+      auto send_complete_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count();
+      
+      // t3 → t4: MAVROS 내부 처리 시간
+      int64_t processing_latency_ns = send_complete_ns - callback_start_ns;
+      double processing_latency_us = processing_latency_ns / 1e3;  // 마이크로초
+      
+      // 로그 업데이트 (t4 추가)
+      if (publish_time_ns > 0) {
+        int64_t total_latency_ns = callback_start_ns - publish_time_ns;
+        double total_latency_us = total_latency_ns / 1e3;  // 마이크로초
+        
+        std::lock_guard<std::mutex> lock(attitude_latency_log_mutex);
+        if (attitude_latency_log_file.is_open()) {
+          attitude_latency_log_file << node_id << ","
+                                     << msg_counter << ","
+                                     << publish_time_ns << ","
+                                     << callback_start_ns << ","
+                                     << send_complete_ns << ","
+                                     << processing_latency_ns << ","
+                                     << processing_latency_us << ","
+                                     << total_latency_ns << ","
+                                     << total_latency_us << "\n";
+        }
+      }
     }
   }
 };

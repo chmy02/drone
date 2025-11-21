@@ -27,6 +27,13 @@
 #include "nav_msgs/msg/odometry.hpp"
 #include "geometry_msgs/msg/transform_stamped.hpp"
 
+// Latency measurement
+#include <chrono>
+#include <fstream>
+#include <mutex>
+#include <sstream>
+#include <iomanip>
+
 namespace mavros
 {
 namespace extra_plugins
@@ -86,6 +93,9 @@ public:
       node->create_subscription<nav_msgs::msg::Odometry>(
       "~/out", 1,
       std::bind(&OdometryPlugin::odom_cb, this, _1));
+
+    // Latency measurement disabled for Topic 8 (odometry - not used)
+    // 로그 파일 생성하지 않음
   }
 
   Subscriptions get_subscriptions() override
@@ -105,6 +115,10 @@ private:
   std::string fcu_odom_child_id_des;
   //!< desired orientation of the fcu map frame
   std::string fcu_map_id_des;
+
+  // Latency measurement
+  std::ofstream latency_log_file;
+  std::mutex latency_log_mutex;
 
   /**
    * @brief Lookup static transform with error handling
@@ -241,6 +255,30 @@ private:
    */
   void odom_cb(const nav_msgs::msg::Odometry::SharedPtr odom)
   {
+    // Latency measurement: callback invocation time
+    auto callback_start_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+      std::chrono::system_clock::now().time_since_epoch()).count();
+
+    // Parse frame_id
+    std::string frame_id = odom->header.frame_id;
+    int64_t publish_time_ns = 0;
+    int node_id = 0;
+    int msg_counter = 0;
+
+    size_t time_pos = frame_id.find("_time_");
+    if (time_pos != std::string::npos) {
+      publish_time_ns = std::stoll(frame_id.substr(time_pos + 6));
+      
+      size_t node_pos = frame_id.find("node_");
+      size_t msg_pos = frame_id.find("_msg_");
+      if (node_pos != std::string::npos && msg_pos != std::string::npos) {
+        node_id = std::stoi(frame_id.substr(node_pos + 5, msg_pos - node_pos - 5));
+        msg_counter = std::stoi(frame_id.substr(msg_pos + 5, time_pos - msg_pos - 5));
+      }
+
+      // Latency will be logged after send_message() completes (at t4)
+    }
+
     /**
      * Required affine rotations to apply transforms
      */
@@ -339,6 +377,33 @@ private:
 
     // send ODOMETRY msg
     uas->send_message(msg);
+    
+    // t4: send_message() 완료 시각 측정
+    auto send_complete_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+      std::chrono::system_clock::now().time_since_epoch()).count();
+    
+    // t3 → t4: MAVROS 내부 처리 시간
+    int64_t processing_latency_ns = send_complete_ns - callback_start_ns;
+    double processing_latency_us = processing_latency_ns / 1e3;  // 마이크로초
+    
+    // 로그 업데이트 (t4 추가)
+    if (publish_time_ns > 0) {
+      int64_t total_latency_ns = callback_start_ns - publish_time_ns;
+      double total_latency_us = total_latency_ns / 1e3;  // 마이크로초
+      
+      std::lock_guard<std::mutex> lock(latency_log_mutex);
+      if (latency_log_file.is_open()) {
+        latency_log_file << node_id << ","
+                         << msg_counter << ","
+                         << publish_time_ns << ","
+                         << callback_start_ns << ","
+                         << send_complete_ns << ","
+                         << processing_latency_ns << ","
+                         << processing_latency_us << ","
+                         << total_latency_ns << ","
+                         << total_latency_us << "\n";
+      }
+    }
   }
 };
 }       // namespace extra_plugins

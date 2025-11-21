@@ -38,6 +38,13 @@
 #include "geometry_msgs/msg/twist_stamped.hpp"
 #include "mavros_msgs/msg/thrust.hpp"
 
+// Latency measurement
+#include <chrono>
+#include <fstream>
+#include <mutex>
+#include <sstream>
+#include <iomanip>
+
 namespace mavros
 {
 namespace std_plugins
@@ -109,6 +116,9 @@ public:
 
     // thrust msg subscriber to sync
     th_sub.subscribe(node, "~/thrust", subscriber_qos);
+
+    // Latency measurement disabled for old Topic 5 (setpoint_attitude - not used)
+    // 로그 파일 생성하지 않음
   }
 
   Subscriptions get_subscriptions() override
@@ -128,6 +138,10 @@ private:
 
   bool reverse_thrust;
   float normalized_thrust;
+
+  // Latency measurement
+  std::ofstream latency_log_file;
+  std::mutex latency_log_mutex;
 
   /**
    * @brief Function to verify if the thrust values are normalized;
@@ -210,6 +224,44 @@ private:
     const geometry_msgs::msg::PoseStamped::SharedPtr pose_msg,
     const mavros_msgs::msg::Thrust::SharedPtr thrust_msg)
   {
+    // Latency measurement: callback invocation time
+    auto callback_start_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+      std::chrono::system_clock::now().time_since_epoch()).count();
+
+    // Parse frame_id: "node_<id>_msg_<counter>_time_<publish_time_ns>"
+    std::string frame_id = pose_msg->header.frame_id;
+    int64_t publish_time_ns = 0;
+    int node_id = 0;
+    int msg_counter = 0;
+
+    size_t time_pos = frame_id.find("_time_");
+    if (time_pos != std::string::npos) {
+      publish_time_ns = std::stoll(frame_id.substr(time_pos + 6));
+      
+      size_t node_pos = frame_id.find("node_");
+      size_t msg_pos = frame_id.find("_msg_");
+      if (node_pos != std::string::npos && msg_pos != std::string::npos) {
+        node_id = std::stoi(frame_id.substr(node_pos + 5, msg_pos - node_pos - 5));
+        msg_counter = std::stoi(frame_id.substr(msg_pos + 5, time_pos - msg_pos - 5));
+      }
+
+      int64_t total_latency_ns = callback_start_ns - publish_time_ns;
+      double total_latency_ms = total_latency_ns / 1e6;
+
+      {
+        std::lock_guard<std::mutex> lock(latency_log_mutex);
+        if (latency_log_file.is_open()) {
+          latency_log_file << node_id << ","
+                           << msg_counter << ","
+                           << publish_time_ns << ","
+                           << callback_start_ns << ","
+                           << total_latency_ns << ","
+                           << total_latency_ms << "\n";
+          latency_log_file.flush();
+        }
+      }
+    }
+
     Eigen::Affine3d tr;
     tf2::fromMsg(pose_msg->pose, tr);
 
