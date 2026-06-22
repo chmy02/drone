@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
 """
-9개의 서로 다른 토픽을 사용하는 노드를 선택적으로 실행하는 스크립트
+13개의 서로 다른 토픽을 사용하는 노드를 선택적으로 실행하는 스크립트
 각 노드는 10Hz로 메시지를 발행하며, latency를 측정합니다.
+측정 시간: 2분 (120초)
 
 사용법:
-  python3 run_multi_topic_experiment.py           # 전체 9개 토픽 실행
-  python3 run_multi_topic_experiment.py 1         # 토픽 1만 실행
-  python3 run_multi_topic_experiment.py 1 2 3     # 토픽 1, 2, 3 실행
-  python3 run_multi_topic_experiment.py 1-5       # 토픽 1~5 실행
+  python3 0_run_topic.py              # 전체 13개 토픽 실행 (0~12)
+  python3 0_run_topic.py 0            # 토픽 0만 실행 (arming)
+  python3 0_run_topic.py 1 2 3        # 토픽 1, 2, 3 실행
+  python3 0_run_topic.py 0-5          # 토픽 0~5 실행
 """
 
 import subprocess
@@ -19,18 +20,26 @@ import signal
 # 설정
 NODE_SCRIPT_DIR = "/home/rtcl-chmy/mavros_ws/src/mavros/chmy/nodes"
 MAVROS_WS = "/home/rtcl-chmy/mavros_ws"
-TEST_DURATION = 60  # 초 (1분)
+TEST_DURATION = 120  # 초 (2분)
 
-# 7개 노드 스크립트 목록 (토픽 이름 기반)
+# 13개 노드 스크립트 목록 (Topic 0 ~ 12)
 NODE_SCRIPTS = [
+    "command_arm.py",                  # Topic 0 (Service: /mavros/cmd/arming)
     "setpoint_raw_local.py",           # Topic 1
     "setpoint_velocity_cmd_vel.py",    # Topic 2
     "setpoint_position_local.py",      # Topic 3
     "setpoint_raw_attitude.py",        # Topic 4
-    "setpoint_accel_accel.py",         # Topic 5 (구 6)
-    "vision_pose_pose.py",             # Topic 6 (구 7)
-    "mocap_pose.py",                   # Topic 7 (구 9)
+    "setpoint_accel_accel.py",         # Topic 5
+    "setpoint_raw_global.py",          # Topic 6
+    "setpoint_trajectory_local.py",    # Topic 7
+    "manual_control_send.py",          # Topic 8
+    "setpoint_position_global.py",     # Topic 9
+    "actuator_control.py",             # Topic 10
+    "vision_pose_pose.py",             # Topic 11
+    "mocap_pose.py",                   # Topic 12
 ]
+
+MAX_TOPIC = 12  # Topic 0 ~ 12 (총 13개)
 
 # 실행된 프로세스들을 저장할 리스트
 processes = []
@@ -121,34 +130,34 @@ def cleanup():
 def parse_topic_selection(args):
     """명령줄 인자에서 토픽 번호 파싱"""
     if not args:
-        # 인자 없으면 전체 토픽 (1~9)
-        return list(range(1, 10))
+        # 인자 없으면 전체 토픽 (0~12)
+        return list(range(0, MAX_TOPIC + 1))
     
     selected = set()
     for arg in args:
         if '-' in arg:
-            # 범위 지정 (예: 1-5)
+            # 범위 지정 (예: 0-5)
             try:
                 start, end = map(int, arg.split('-'))
                 selected.update(range(start, end + 1))
             except:
                 print(f"⚠️  잘못된 범위 형식: {arg}")
         else:
-            # 개별 번호 (예: 1, 2, 3)
+            # 개별 번호 (예: 0, 1, 2)
             try:
                 selected.add(int(arg))
             except:
                 print(f"⚠️  잘못된 토픽 번호: {arg}")
     
-    # 1~9 범위로 제한
-    selected = [t for t in sorted(selected) if 1 <= t <= 9]
+    # 0~12 범위로 제한
+    selected = [t for t in sorted(selected) if 0 <= t <= MAX_TOPIC]
     return selected
 
 
 def run_experiment(selected_topics):
     """실험 실행"""
-    # 선택된 토픽에 해당하는 스크립트만 필터링
-    scripts_to_run = [(i, NODE_SCRIPTS[i-1]) for i in selected_topics]
+    # 선택된 토픽에 해당하는 스크립트만 필터링 (Topic 0부터 시작)
+    scripts_to_run = [(i, NODE_SCRIPTS[i]) for i in selected_topics]
     
     print("=" * 80)
     print("🚀 다중 토픽 Latency 측정 실험 시작")
@@ -182,7 +191,7 @@ def run_experiment(selected_topics):
                 stderr=subprocess.PIPE
             )
             processes.append(proc)
-            print(f"   ✅ Topic {topic_num} 시작: {script}")
+            print(f"   ✅ Topic {topic_num:2d} 시작: {script}")
             time.sleep(0.2)  # 약간의 지연
         except Exception as e:
             print(f"   ❌ Topic {topic_num} 실행 실패: {e}")
@@ -208,12 +217,12 @@ def run_experiment(selected_topics):
         log_files = sorted([f for f in os.listdir(log_dir) if f.endswith('.log')])
         if log_files:
             print(f"✅ 로그 파일 생성됨:")
-            for log_file in log_files[-10:]:  # 최근 10개만 표시
+            for log_file in log_files[-15:]:  # 최근 15개만 표시
                 log_path = os.path.join(log_dir, log_file)
                 size = os.path.getsize(log_path)
                 print(f"   - {log_file} ({size} bytes)")
             print(f"\n💡 분석 스크립트를 실행하세요:")
-            print(f"   python3 /home/rtcl-chmy/mavros_ws/src/mavros/chmy/test/analyze_multi_topic.py")
+            print(f"   python3 /home/rtcl-chmy/mavros_ws/src/mavros/chmy/test/2_analyze_multi_topic.py")
         else:
             print("❌ 로그 파일이 생성되지 않았습니다.")
     else:
@@ -227,16 +236,16 @@ def main():
     # 명령줄 인자 파싱
     selected_topics = parse_topic_selection(sys.argv[1:])
     
-    if not selected_topics:
-        print("❌ 유효한 토픽을 선택하세요 (1~9)")
+    if not selected_topics and selected_topics != [0]:
+        print(f"❌ 유효한 토픽을 선택하세요 (0~{MAX_TOPIC})")
         print("\n사용법:")
-        print("  python3 run_multi_topic_experiment.py           # 전체 9개 토픽")
-        print("  python3 run_multi_topic_experiment.py 1         # 토픽 1만")
-        print("  python3 run_multi_topic_experiment.py 1 2 3     # 토픽 1, 2, 3")
-        print("  python3 run_multi_topic_experiment.py 1-5       # 토픽 1~5")
+        print(f"  python3 0_run_topic.py              # 전체 {MAX_TOPIC + 1}개 토픽 (0~12)")
+        print("  python3 0_run_topic.py 0            # 토픽 0만 (arming)")
+        print("  python3 0_run_topic.py 1 2 3        # 토픽 1, 2, 3")
+        print("  python3 0_run_topic.py 0-5          # 토픽 0~5")
         print("\n📋 토픽 목록:")
-        for i, script in enumerate(NODE_SCRIPTS, 1):
-            print(f"  {i}. {script}")
+        for i, script in enumerate(NODE_SCRIPTS, 0):
+            print(f"  {i:2d}. {script}")
         sys.exit(1)
     
     try:
@@ -249,4 +258,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

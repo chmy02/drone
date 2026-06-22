@@ -107,6 +107,15 @@ public:
     if (latency_log_file.is_open()) {
       RCLCPP_INFO(get_logger(), "Latency log: %s", ss.str().c_str());
     }
+
+    // Global latency measurement log file (Topic 9)
+    std::stringstream ss_global;
+    ss_global << "/home/rtcl-chmy/mavros_ws/src/mavros/chmy/logs/"
+       << std::put_time(std::localtime(&time_t), "%Y%m%d_%H%M%S") << "_topic9_setpoint_position_global_latency.log";
+    global_latency_log_file.open(ss_global.str(), std::ios::out | std::ios::app);
+    if (global_latency_log_file.is_open()) {
+      RCLCPP_INFO(get_logger(), "Global latency log: %s", ss_global.str().c_str());
+    }
   }
 
   Subscriptions get_subscriptions() override
@@ -143,6 +152,10 @@ private:
   // Latency measurement
   std::ofstream latency_log_file;
   std::mutex latency_log_mutex;
+
+  // Global latency measurement (Topic 9)
+  std::ofstream global_latency_log_file;
+  std::mutex global_latency_log_mutex;
 
   /* -*- mid-level helpers -*- */
 
@@ -197,59 +210,56 @@ private:
 
   void setpoint_cb(const geometry_msgs::msg::PoseStamped::SharedPtr req)
   {
-    // Latency measurement: callback invocation time
     auto callback_start_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
       std::chrono::system_clock::now().time_since_epoch()).count();
 
-    // Parse frame_id: "node_<id>_msg_<counter>_time_<publish_time_ns>"
     std::string frame_id = req->header.frame_id;
     int64_t publish_time_ns = 0;
     int node_id = 0;
     int msg_counter = 0;
+    double cpu_total = 0.0, cpu_gz = 0.0, cpu_px4 = 0.0, cpu_mav = 0.0;
 
     size_t time_pos = frame_id.find("_time_");
+    size_t cpu_pos = frame_id.find("_cpu_");
     if (time_pos != std::string::npos) {
-      publish_time_ns = std::stoll(frame_id.substr(time_pos + 6));
-      
-      size_t node_pos = frame_id.find("node_");
-      size_t msg_pos = frame_id.find("_msg_");
-      if (node_pos != std::string::npos && msg_pos != std::string::npos) {
-        node_id = std::stoi(frame_id.substr(node_pos + 5, msg_pos - node_pos - 5));
-        msg_counter = std::stoi(frame_id.substr(msg_pos + 5, time_pos - msg_pos - 5));
-      }
-
-      // Latency will be logged after send_message() completes (at t4)
+      try {
+        size_t node_pos = frame_id.find("node_");
+        size_t msg_pos = frame_id.find("_msg_");
+        if (node_pos != std::string::npos && msg_pos != std::string::npos) {
+          node_id = std::stoi(frame_id.substr(node_pos + 5, msg_pos - node_pos - 5));
+          msg_counter = std::stoi(frame_id.substr(msg_pos + 5, time_pos - msg_pos - 5));
+        }
+        size_t end_pos = (cpu_pos != std::string::npos) ? cpu_pos : frame_id.length();
+        publish_time_ns = std::stoll(frame_id.substr(time_pos + 6, end_pos - time_pos - 6));
+        if (cpu_pos != std::string::npos) {
+          size_t gz_pos = frame_id.find("_gz_");
+          size_t px4_pos = frame_id.find("_px4_");
+          size_t mav_pos = frame_id.find("_mav_");
+          if (gz_pos != std::string::npos) cpu_total = std::stod(frame_id.substr(cpu_pos + 5, gz_pos - cpu_pos - 5));
+          if (px4_pos != std::string::npos) cpu_gz = std::stod(frame_id.substr(gz_pos + 4, px4_pos - gz_pos - 4));
+          if (mav_pos != std::string::npos) cpu_px4 = std::stod(frame_id.substr(px4_pos + 5, mav_pos - px4_pos - 5));
+          cpu_mav = std::stod(frame_id.substr(mav_pos + 5));
+        }
+      } catch (...) {}
     }
 
     Eigen::Affine3d tr;
     tf2::fromMsg(req->pose, tr);
-
     send_position_target(req->header.stamp, tr);
     
-    // t4: send_message() 완료 시각 측정
     auto send_complete_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
       std::chrono::system_clock::now().time_since_epoch()).count();
     
-    // t3 → t4: MAVROS 내부 처리 시간
-    int64_t processing_latency_ns = send_complete_ns - callback_start_ns;
-    double processing_latency_us = processing_latency_ns / 1e3;  // 마이크로초
-    
-    // 로그 업데이트 (t4 추가)
     if (publish_time_ns > 0) {
-      int64_t total_latency_ns = callback_start_ns - publish_time_ns;
-      double total_latency_us = total_latency_ns / 1e3;  // 마이크로초
+      double t1_t3_us = (callback_start_ns - publish_time_ns) / 1000.0;
+      double t3_t4_us = (send_complete_ns - callback_start_ns) / 1000.0;
+      double t1_t4_us = (send_complete_ns - publish_time_ns) / 1000.0;
       
       std::lock_guard<std::mutex> lock(latency_log_mutex);
       if (latency_log_file.is_open()) {
-        latency_log_file << node_id << ","
-                         << msg_counter << ","
-                         << publish_time_ns << ","
-                         << callback_start_ns << ","
-                         << send_complete_ns << ","
-                         << processing_latency_ns << ","
-                         << processing_latency_us << ","
-                         << total_latency_ns << ","
-                         << total_latency_us << "\n";
+        latency_log_file << node_id << "," << msg_counter << ","
+                         << t1_t3_us << "," << t3_t4_us << "," << t1_t4_us << ","
+                         << cpu_total << "," << cpu_gz << "," << cpu_px4 << "," << cpu_mav << "\n";
       }
     }
   }
@@ -259,8 +269,40 @@ private:
    */
   void setpointg_cb(const geographic_msgs::msg::GeoPoseStamped::SharedPtr req)
   {
-    using mavlink::common::POSITION_TARGET_TYPEMASK;
+    auto callback_start_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+      std::chrono::system_clock::now().time_since_epoch()).count();
 
+    std::string frame_id = req->header.frame_id;
+    uint64_t publish_time_ns = 0;
+    int node_id = 0;
+    uint64_t msg_counter = 0;
+    double cpu_total = 0.0, cpu_gz = 0.0, cpu_px4 = 0.0, cpu_mav = 0.0;
+    
+    size_t time_pos = frame_id.find("_time_");
+    size_t cpu_pos = frame_id.find("_cpu_");
+    if (time_pos != std::string::npos) {
+      try {
+        size_t node_pos = frame_id.find("node_");
+        size_t msg_pos = frame_id.find("_msg_");
+        if (node_pos != std::string::npos && msg_pos != std::string::npos) {
+          node_id = std::stoi(frame_id.substr(node_pos + 5, msg_pos - node_pos - 5));
+          msg_counter = std::stoull(frame_id.substr(msg_pos + 5, time_pos - msg_pos - 5));
+        }
+        size_t end_pos = (cpu_pos != std::string::npos) ? cpu_pos : frame_id.length();
+        publish_time_ns = std::stoull(frame_id.substr(time_pos + 6, end_pos - time_pos - 6));
+        if (cpu_pos != std::string::npos) {
+          size_t gz_pos = frame_id.find("_gz_");
+          size_t px4_pos = frame_id.find("_px4_");
+          size_t mav_pos = frame_id.find("_mav_");
+          if (gz_pos != std::string::npos) cpu_total = std::stod(frame_id.substr(cpu_pos + 5, gz_pos - cpu_pos - 5));
+          if (px4_pos != std::string::npos) cpu_gz = std::stod(frame_id.substr(gz_pos + 4, px4_pos - gz_pos - 4));
+          if (mav_pos != std::string::npos) cpu_px4 = std::stod(frame_id.substr(px4_pos + 5, mav_pos - px4_pos - 5));
+          cpu_mav = std::stod(frame_id.substr(mav_pos + 5));
+        }
+      } catch (...) {}
+    }
+
+    using mavlink::common::POSITION_TARGET_TYPEMASK;
     uint16_t type_mask = uint16_t(POSITION_TARGET_TYPEMASK::VX_IGNORE) |
       uint16_t(POSITION_TARGET_TYPEMASK::VY_IGNORE) |
       uint16_t(POSITION_TARGET_TYPEMASK::VZ_IGNORE) |
@@ -273,16 +315,25 @@ private:
       ftf::transform_orientation_baselink_aircraft(attitude));
 
     set_position_target_global_int(
-      get_time_boot_ms(req->header.stamp),
-      uint8_t(MAV_FRAME::GLOBAL_INT),
-      type_mask,
-      req->pose.position.latitude * 1e7,
-      req->pose.position.longitude * 1e7,
-      req->pose.position.altitude,
-      Eigen::Vector3d::Zero(),
-      Eigen::Vector3d::Zero(),
-      ftf::quaternion_get_yaw(q),
-      0);
+      get_time_boot_ms(req->header.stamp), uint8_t(MAV_FRAME::GLOBAL_INT), type_mask,
+      req->pose.position.latitude * 1e7, req->pose.position.longitude * 1e7, req->pose.position.altitude,
+      Eigen::Vector3d::Zero(), Eigen::Vector3d::Zero(), ftf::quaternion_get_yaw(q), 0);
+
+    auto send_complete_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+      std::chrono::system_clock::now().time_since_epoch()).count();
+    
+    if (publish_time_ns > 0) {
+      double t1_t3_us = (callback_start_ns - publish_time_ns) / 1000.0;
+      double t3_t4_us = (send_complete_ns - callback_start_ns) / 1000.0;
+      double t1_t4_us = (send_complete_ns - publish_time_ns) / 1000.0;
+      
+      std::lock_guard<std::mutex> lock(global_latency_log_mutex);
+      if (global_latency_log_file.is_open()) {
+        global_latency_log_file << node_id << "," << msg_counter << ","
+                                << t1_t3_us << "," << t3_t4_us << "," << t1_t4_us << ","
+                                << cpu_total << "," << cpu_gz << "," << cpu_px4 << "," << cpu_mav << "\n";
+      }
+    }
   }
 
   /**

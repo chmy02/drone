@@ -1,23 +1,23 @@
 #!/usr/bin/env python3
 """
-Topic: /mavros/vision_pose/pose (geometry_msgs/PoseStamped)
+Topic 10: /mavros/actuator_control (mavros_msgs/ActuatorControl)
 발행 주기: 10Hz
 """
 
 import rclpy
 from rclpy.node import Node
-from geometry_msgs.msg import PoseStamped
+from mavros_msgs.msg import ActuatorControl
 import time
 import psutil
 import gc
 gc.enable()  # 실험: GC 활성화 상태에서 레이턴시 측정
 
 
-class VisionPosePoseNode(Node):
+class ActuatorControlNode(Node):
     def __init__(self):
-        super().__init__('vision_pose_pose_node')
+        super().__init__('actuator_control_node')
         
-        self.node_id = 11
+        self.node_id = 10
         self.msg_counter = 0
         
         self.gz_proc = None
@@ -27,13 +27,13 @@ class VisionPosePoseNode(Node):
         psutil.cpu_percent()
         
         self.publisher = self.create_publisher(
-            PoseStamped,
-            '/mavros/vision_pose/pose',
+            ActuatorControl,
+            '/mavros/actuator_control',
             10
         )
         
         self.timer = self.create_timer(0.1, self.publish_message)
-        self.get_logger().info(f'Node {self.node_id} started: /mavros/vision_pose/pose @ 10Hz')
+        self.get_logger().info(f'Node {self.node_id} started: /mavros/actuator_control @ 10Hz')
     
     def _find_processes(self):
         for proc in psutil.process_iter(['pid', 'name', 'cmdline']):
@@ -64,7 +64,7 @@ class VisionPosePoseNode(Node):
         return cpu_total, cpu_gz, cpu_px4, cpu_mav
     
     def publish_message(self):
-        msg = PoseStamped()
+        msg = ActuatorControl()
         publish_time_ns = time.time_ns()
         self.msg_counter += 1
         cpu_total, cpu_gz, cpu_px4, cpu_mav = self._get_cpu_info()
@@ -73,17 +73,15 @@ class VisionPosePoseNode(Node):
         msg.header.frame_id = (f"node_{self.node_id}_msg_{self.msg_counter}_time_{publish_time_ns}"
                                f"_cpu_{cpu_total:.1f}_gz_{cpu_gz:.1f}_px4_{cpu_px4:.1f}_mav_{cpu_mav:.1f}")
         
-        msg.pose.position.x = 0.0
-        msg.pose.position.y = 0.0
-        msg.pose.position.z = 1.0
-        msg.pose.orientation.w = 1.0
+        msg.group_mix = 0
+        msg.controls = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
         
         self.publisher.publish(msg)
 
 
 def main(args=None):
     rclpy.init(args=args)
-    node = VisionPosePoseNode()
+    node = ActuatorControlNode()
     try:
         rclpy.spin(node)
     except KeyboardInterrupt:

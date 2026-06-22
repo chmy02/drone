@@ -19,6 +19,9 @@
 #include <condition_variable>
 #include <list>
 #include <memory>
+#include <fstream>
+#include <sstream>
+#include <iomanip>
 
 #include "rcpputils/asserts.hpp"
 #include "mavros/mavros_uas.hpp"
@@ -72,6 +75,16 @@ public:
     use_comp_id_system_control(false),
     command_ack_timeout_dt(ACK_TIMEOUT_DEFAULT)
   {
+    // Latency measurement log file (Topic 0 - Service)
+    auto now = std::chrono::system_clock::now();
+    auto time_t = std::chrono::system_clock::to_time_t(now);
+    std::stringstream ss;
+    ss << "/home/rtcl-chmy/mavros_ws/src/mavros/chmy/logs/" << std::put_time(std::localtime(&time_t), "%Y%m%d_%H%M%S") << "_topic0_command_arm_latency.log";
+    latency_log_file.open(ss.str(), std::ios::out | std::ios::app);
+    if (latency_log_file.is_open()) {
+      RCLCPP_INFO(get_logger(), "Latency log file opened: %s", ss.str().c_str());
+    }
+
     enable_node_watch_parameters();
 
     node_declare_and_watch_parameter(
@@ -181,6 +194,12 @@ private:
 
   L_CommandTransaction ack_waiting_list;
   rclcpp::Duration command_ack_timeout_dt;
+
+  // Latency measurement (Topic 0 - Service)
+  std::ofstream latency_log_file;
+  std::mutex latency_log_mutex;
+  uint64_t service_counter = 0;
+  uint64_t arming_cb_invocation_count = 0;  // 콜백 호출 횟수 (throw 시에도 로그용)
 
   /* -*- message handlers -*- */
 
@@ -416,12 +435,104 @@ private:
     mavros_msgs::srv::CommandBool::Response::SharedPtr res)
   {
     using mavlink::common::MAV_CMD;
-    send_command_long_and_wait(
+
+    // 콜백 호출마다 카운트 (throw 시에도 로그 기록용)
+    arming_cb_invocation_count++;
+    int node_id = 0;
+    uint64_t msg_counter = arming_cb_invocation_count;
+
+    // t3: Service callback 시작 시각
+    auto callback_start_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+      std::chrono::system_clock::now().time_since_epoch()).count();
+
+    // 요청에서 t1(timestamp_ns) 및 CPU 메타 파싱
+    uint64_t publish_time_ns = req->timestamp_ns;
+    double cpu_total = 0.0, cpu_gz = 0.0, cpu_px4 = 0.0, cpu_mav = 0.0;
+    if (!req->cpu_meta.empty()) {
+      try {
+        std::string s = req->cpu_meta;
+        size_t a = 0, b = s.find('_');
+        if (b != std::string::npos) { cpu_total = std::stod(s.substr(a, b - a)); a = b + 1; b = s.find('_', a); }
+        if (b != std::string::npos) { cpu_gz = std::stod(s.substr(a, b - a)); a = b + 1; b = s.find('_', a); }
+        if (b != std::string::npos) { cpu_px4 = std::stod(s.substr(a, b - a)); a = b + 1; }
+        cpu_mav = std::stod(s.substr(a));
+      } catch (...) {}
+    }
+
+    using mavlink::common::MAV_RESULT;
+    uint16_t command = enum_value(MAV_CMD::COMPONENT_ARM_DISARM);
+    float param1 = (req->value) ? 1.0 : 0.0;
+
+    unique_lock ack_lock(mutex);
+    L_CommandTransaction::iterator ack_it;
+
+    /* check transactions */
+    for (const auto & tr : ack_waiting_list) {
+      if (tr.expected_command == command) {
+        RCLCPP_WARN_THROTTLE(
+          get_logger(),
+          *get_clock(), 10000, "CMD: Command %u already in progress", command);
+        // "operation in progress" 시에도 로그 한 줄 기록 (t3_t4=0, t1_t4=0), t1_t3·CPU는 요청 값 사용
+        double t1_t3_reject = 0.0;
+        if (publish_time_ns > 0) {
+          t1_t3_reject = (static_cast<int64_t>(callback_start_ns) - static_cast<int64_t>(publish_time_ns)) / 1000.0;
+        }
+        {
+          std::lock_guard<std::mutex> log_lock(latency_log_mutex);
+          if (latency_log_file.is_open()) {
+            latency_log_file << node_id << "," << msg_counter << ","
+                             << t1_t3_reject << "," << 0.0 << "," << 0.0 << ","
+                             << cpu_total << "," << cpu_gz << "," << cpu_px4 << "," << cpu_mav << "\n";
+            latency_log_file.flush();
+          }
+        }
+        throw std::logic_error("operation in progress");
+      }
+    }
+
+    bool is_ack_required = uas->is_ardupilotmega() || uas->is_px4();
+    if (is_ack_required) {
+      ack_it = ack_waiting_list.emplace(ack_waiting_list.end(), command);
+    }
+
+    // command_long 호출 (send_message 완료까지)
+    command_long(
       false,
-      enum_value(MAV_CMD::COMPONENT_ARM_DISARM), 1,
-      (req->value) ? 1.0 : 0.0,
-      0, 0, 0, 0, 0, 0,
-      res->success, res->result);
+      command, 1,
+      param1, 0, 0, 0, 0, 0, 0);
+
+    // t4: send_message() 완료 시각
+    auto send_complete_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+      std::chrono::system_clock::now().time_since_epoch()).count();
+
+    // 레이턴시 계산 (마이크로초) - t1은 요청의 timestamp_ns
+    double t1_t3_us = 0.0;
+    double t3_t4_us = (send_complete_ns - callback_start_ns) / 1000.0;
+    double t1_t4_us = t3_t4_us;
+    if (publish_time_ns > 0) {
+      t1_t3_us = (static_cast<int64_t>(callback_start_ns) - static_cast<int64_t>(publish_time_ns)) / 1000.0;
+      t1_t4_us = (static_cast<int64_t>(send_complete_ns) - static_cast<int64_t>(publish_time_ns)) / 1000.0;
+    }
+
+    std::lock_guard<std::mutex> log_lock(latency_log_mutex);
+    if (latency_log_file.is_open()) {
+      latency_log_file << node_id << "," << msg_counter << ","
+                       << t1_t3_us << "," << t3_t4_us << "," << t1_t4_us << ","
+                       << cpu_total << "," << cpu_gz << "," << cpu_px4 << "," << cpu_mav << "\n";
+      latency_log_file.flush();
+    }
+
+    // ACK 대기 및 응답 설정
+    if (is_ack_required) {
+      ack_lock.unlock();
+      bool is_not_timeout = wait_ack_for(*ack_it, res->result);
+      ack_lock.lock();
+      res->success = is_not_timeout && res->result == enum_value(MAV_RESULT::ACCEPTED);
+      ack_waiting_list.erase(ack_it);
+    } else {
+      res->success = true;
+      res->result = enum_value(MAV_RESULT::ACCEPTED);
+    }
   }
 
   void set_home_cb(

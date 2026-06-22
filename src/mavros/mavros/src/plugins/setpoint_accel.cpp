@@ -125,59 +125,56 @@ private:
 
   void accel_cb(const geometry_msgs::msg::Vector3Stamped::SharedPtr req)
   {
-    // Latency measurement: callback invocation time
     auto callback_start_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
       std::chrono::system_clock::now().time_since_epoch()).count();
 
-    // Parse frame_id
     std::string frame_id = req->header.frame_id;
     int64_t publish_time_ns = 0;
     int node_id = 0;
     int msg_counter = 0;
+    double cpu_total = 0.0, cpu_gz = 0.0, cpu_px4 = 0.0, cpu_mav = 0.0;
 
     size_t time_pos = frame_id.find("_time_");
+    size_t cpu_pos = frame_id.find("_cpu_");
     if (time_pos != std::string::npos) {
-      publish_time_ns = std::stoll(frame_id.substr(time_pos + 6));
-      
-      size_t node_pos = frame_id.find("node_");
-      size_t msg_pos = frame_id.find("_msg_");
-      if (node_pos != std::string::npos && msg_pos != std::string::npos) {
-        node_id = std::stoi(frame_id.substr(node_pos + 5, msg_pos - node_pos - 5));
-        msg_counter = std::stoi(frame_id.substr(msg_pos + 5, time_pos - msg_pos - 5));
-      }
-
-      // Latency will be logged after send_message() completes (at t4)
+      try {
+        size_t node_pos = frame_id.find("node_");
+        size_t msg_pos = frame_id.find("_msg_");
+        if (node_pos != std::string::npos && msg_pos != std::string::npos) {
+          node_id = std::stoi(frame_id.substr(node_pos + 5, msg_pos - node_pos - 5));
+          msg_counter = std::stoi(frame_id.substr(msg_pos + 5, time_pos - msg_pos - 5));
+        }
+        size_t end_pos = (cpu_pos != std::string::npos) ? cpu_pos : frame_id.length();
+        publish_time_ns = std::stoll(frame_id.substr(time_pos + 6, end_pos - time_pos - 6));
+        if (cpu_pos != std::string::npos) {
+          size_t gz_pos = frame_id.find("_gz_");
+          size_t px4_pos = frame_id.find("_px4_");
+          size_t mav_pos = frame_id.find("_mav_");
+          if (gz_pos != std::string::npos) cpu_total = std::stod(frame_id.substr(cpu_pos + 5, gz_pos - cpu_pos - 5));
+          if (px4_pos != std::string::npos) cpu_gz = std::stod(frame_id.substr(gz_pos + 4, px4_pos - gz_pos - 4));
+          if (mav_pos != std::string::npos) cpu_px4 = std::stod(frame_id.substr(px4_pos + 5, mav_pos - px4_pos - 5));
+          cpu_mav = std::stod(frame_id.substr(mav_pos + 5));
+        }
+      } catch (...) {}
     }
 
     Eigen::Vector3d accel_enu;
-
     tf2::fromMsg(req->vector, accel_enu);
     send_setpoint_acceleration(req->header.stamp, accel_enu);
     
-    // t4: send_message() 완료 시각 측정
     auto send_complete_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
       std::chrono::system_clock::now().time_since_epoch()).count();
     
-    // t3 → t4: MAVROS 내부 처리 시간
-    int64_t processing_latency_ns = send_complete_ns - callback_start_ns;
-    double processing_latency_us = processing_latency_ns / 1e3;  // 마이크로초
-    
-    // 로그 업데이트 (t4 추가)
     if (publish_time_ns > 0) {
-      int64_t total_latency_ns = callback_start_ns - publish_time_ns;
-      double total_latency_us = total_latency_ns / 1e3;  // 마이크로초
+      double t1_t3_us = (callback_start_ns - publish_time_ns) / 1000.0;
+      double t3_t4_us = (send_complete_ns - callback_start_ns) / 1000.0;
+      double t1_t4_us = (send_complete_ns - publish_time_ns) / 1000.0;
       
       std::lock_guard<std::mutex> lock(latency_log_mutex);
       if (latency_log_file.is_open()) {
-        latency_log_file << node_id << ","
-                         << msg_counter << ","
-                         << publish_time_ns << ","
-                         << callback_start_ns << ","
-                         << send_complete_ns << ","
-                         << processing_latency_ns << ","
-                         << processing_latency_us << ","
-                         << total_latency_ns << ","
-                         << total_latency_us << "\n";
+        latency_log_file << node_id << "," << msg_counter << ","
+                         << t1_t3_us << "," << t3_t4_us << "," << t1_t4_us << ","
+                         << cpu_total << "," << cpu_gz << "," << cpu_px4 << "," << cpu_mav << "\n";
       }
     }
   }

@@ -1,6 +1,9 @@
 # Common type for switch commands
 
 bool value
+# Optional: for latency measurement (0 / empty = not used)
+uint64 timestamp_ns
+string cpu_meta
 ---
 bool success
 uint8 result

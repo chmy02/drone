@@ -1,17 +1,19 @@
 #!/usr/bin/env python3
 """
-7개 토픽을 자동으로 순차 실행하는 스크립트
-각 토픽을 1분씩 측정합니다.
+13개 토픽을 자동으로 순차 실행하는 스크립트
+각 토픽을 2분씩 측정합니다.
 
-Topic 1~7: 번호 재정렬 완료
+Topic 0: 서비스 콜 (arming)
+Topic 1~10: 기본 플러그인 (mavros)
+Topic 11~12: Extras 플러그인 (mavros_extras)
 """
 
 import subprocess
 import sys
 import time
 
-# 7개 토픽 리스트 (번호 재정렬 완료)
-SUCCESSFUL_TOPICS = [1, 2, 3, 4, 5, 6, 7]
+# 13개 토픽 리스트 (Topic 0 ~ 12)
+SUCCESSFUL_TOPICS = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
 
 def run_topic(topic_num, current, total):
     """단일 토픽 실험 실행"""
@@ -47,9 +49,9 @@ def main():
     print("🚀 자동 순차 측정 시작")
     print("=" * 80)
     print(f"📊 측정할 토픽: {SUCCESSFUL_TOPICS}")
-    print(f"⏱️  각 토픽 측정 시간: 1분 (60초)")
+    print(f"⏱️  각 토픽 측정 시간: 2분 (120초)")
     print(f"⏱️  토픽 간 간격: 2초")
-    print(f"⏱️  예상 총 소요 시간: 약 {total_topics * 1.2:.0f}분")
+    print(f"⏱️  예상 총 소요 시간: 약 {total_topics * 2.2:.0f}분 (~{total_topics * 2.2 / 60:.1f}시간)")
     print("=" * 80)
     
     # 사용자 확인

@@ -4,6 +4,12 @@
 core
 .vscode/
 
+# 로컬 CPU 코어 설정 (예시는 cpu_affinity.env.example)
+chmy/scripts/cpu_affinity.env
+
+# 실험 로그 (로컬 생성, git 제외)
+chmy/logs/
+
 # generated
 libmavconn/include/mavconn/mavlink_dialect.hpp
 libmavconn/src/mavlink_helpers.cpp

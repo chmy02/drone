@@ -17,6 +17,7 @@
  */
 
 #include <chrono>
+#include <cstdint>
 #include <fstream>
 #include <sstream>
 #include <iomanip>
@@ -79,6 +80,20 @@ public:
       RCLCPP_INFO(get_logger(), "Velocity latency log file opened: %s", ss.str().c_str());
     }
 
+    std::stringstream ss_e2e;
+    ss_e2e << "/home/rtcl-chmy/mavros_ws/src/mavros/chmy/logs/" <<
+      std::put_time(std::localtime(&time_t), "%Y%m%d_%H%M%S") <<
+      "_obstacle_stop_mavros_t4.log";
+    obstacle_e2e_t4_log.open(ss_e2e.str(), std::ios::out | std::ios::app);
+    if (obstacle_e2e_t4_log.is_open()) {
+      obstacle_e2e_t4_log <<
+        "# obstacle_stop E2E: lidar_corr_stamp_ns t_mavros_cb_ros_ns "
+        "t4_after mavlink_send_ros_ns (ROS clock ns; Python t1_ns/t5와 동일 축으로 use_sim_time 권장)\n";
+      RCLCPP_INFO(
+        get_logger(), "Obstacle E2E t4 log opened: %s",
+        ss_e2e.str().c_str());
+    }
+
     auto sensor_qos = rclcpp::SensorDataQoS();
 
     // cmd_vel usually is the topic used for velocity control in many controllers / planners
@@ -107,6 +122,7 @@ private:
 
   // Latency measurement
   std::ofstream latency_log_file;
+  std::ofstream obstacle_e2e_t4_log;
   std::mutex latency_log_mutex;
   std::atomic<uint64_t> msg_count{0};
 
@@ -156,74 +172,75 @@ private:
 
   void vel_cb(const geometry_msgs::msg::TwistStamped::SharedPtr req)
   {
-    // Latency measurement: callback 시작 시각 (나노초)
-    // system_clock 사용 (Python의 time.time_ns()와 동일한 기준)
-    auto callback_start_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
-      std::chrono::system_clock::now().time_since_epoch()).count();
+    const int64_t t_mavros_cb_ros_ns = node->now().nanoseconds();
 
-    // Parse timestamp from frame_id if available
-    // Format: "node_{node_id}_msg_{counter}_time_{publish_time_ns}"
-    uint64_t publish_time_ns = 0;
-    int node_id = 0;
-    uint64_t msg_counter = 0;
+    auto t3_callback_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+      std::chrono::system_clock::now().time_since_epoch()).count();
     
-    if (req->header.frame_id.find("_time_") != std::string::npos) {
-      // Extract publish time from frame_id
-      try {
-        size_t time_pos = req->header.frame_id.find("_time_");
-        if (time_pos != std::string::npos) {
-          std::string time_str = req->header.frame_id.substr(time_pos + 6);
-          publish_time_ns = std::stoull(time_str);
-          
-          // Extract node_id and msg_counter
-          size_t node_pos = req->header.frame_id.find("node_");
-          size_t msg_pos = req->header.frame_id.find("_msg_");
-          if (node_pos != std::string::npos && msg_pos != std::string::npos) {
-            node_id = std::stoi(req->header.frame_id.substr(node_pos + 5, msg_pos - node_pos - 5));
-            size_t msg_end = req->header.frame_id.find("_time_");
-            if (msg_end != std::string::npos) {
-              msg_counter = std::stoull(req->header.frame_id.substr(msg_pos + 5, msg_end - msg_pos - 5));
-            }
-          }
-          
-          // Latency will be logged after send_message() completes (at t4)
-        }
-      } catch (const std::exception& e) {
-        // Ignore parsing errors
+    uint64_t t1_publish_ns = static_cast<uint64_t>(req->header.stamp.sec) * 1000000000ULL 
+                           + static_cast<uint64_t>(req->header.stamp.nanosec);
+
+    int node_id = 2;
+    uint64_t msg_counter = 0;
+    double cpu_total = 0.0, cpu_gz = 0.0, cpu_px4 = 0.0, cpu_mav = 0.0;
+    
+    std::string frame_id = req->header.frame_id;
+    try {
+      size_t node_pos = frame_id.find("node_");
+      size_t msg_pos = frame_id.find("_msg_");
+      size_t time_pos = frame_id.find("_time_");
+      size_t cpu_pos = frame_id.find("_cpu_");
+      
+      if (node_pos != std::string::npos && msg_pos != std::string::npos)
+        node_id = std::stoi(frame_id.substr(node_pos + 5, msg_pos - node_pos - 5));
+      if (msg_pos != std::string::npos && time_pos != std::string::npos)
+        msg_counter = std::stoull(frame_id.substr(msg_pos + 5, time_pos - msg_pos - 5));
+      if (cpu_pos != std::string::npos) {
+        size_t gz_pos = frame_id.find("_gz_");
+        size_t px4_pos = frame_id.find("_px4_");
+        size_t mav_pos = frame_id.find("_mav_");
+        if (gz_pos != std::string::npos) cpu_total = std::stod(frame_id.substr(cpu_pos + 5, gz_pos - cpu_pos - 5));
+        if (px4_pos != std::string::npos) cpu_gz = std::stod(frame_id.substr(gz_pos + 4, px4_pos - gz_pos - 4));
+        if (mav_pos != std::string::npos) cpu_px4 = std::stod(frame_id.substr(px4_pos + 5, mav_pos - px4_pos - 5));
+        cpu_mav = std::stod(frame_id.substr(mav_pos + 5));
+      }
+    } catch (...) {}
+
+    Eigen::Vector3d vel_enu;
+    tf2::fromMsg(req->twist.linear, vel_enu);
+    send_setpoint_velocity(req->header.stamp, vel_enu, req->twist.angular.z);
+    
+    const int64_t t4_after_send_ros_ns = node->now().nanoseconds();
+
+    // obstacle_e2e 또는 동일 접두사+패딩(cmd_vel 크기 확대 실험)
+    static constexpr const char kObstacleE2e[] = "obstacle_e2e";
+    const bool obstacle_e2e_tag =
+      (frame_id.size() >= sizeof(kObstacleE2e) - 1) &&
+      (frame_id.compare(0, sizeof(kObstacleE2e) - 1, kObstacleE2e) == 0);
+
+    if (obstacle_e2e_tag) {
+      std::lock_guard<std::mutex> lock(latency_log_mutex);
+      if (obstacle_e2e_t4_log.is_open()) {
+        obstacle_e2e_t4_log << t1_publish_ns << ',' << t_mavros_cb_ros_ns << ','
+                            << t4_after_send_ros_ns << '\n';
+        obstacle_e2e_t4_log.flush();
       }
     }
 
-    Eigen::Vector3d vel_enu;
-
-    tf2::fromMsg(req->twist.linear, vel_enu);
-    send_setpoint_velocity(
-      req->header.stamp, vel_enu,
-      req->twist.angular.z);
-    
-    // t4: send_message() 완료 시각 측정
-    auto send_complete_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+    auto t4_send_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
       std::chrono::system_clock::now().time_since_epoch()).count();
     
-    // t3 → t4: MAVROS 내부 처리 시간
-    int64_t processing_latency_ns = send_complete_ns - callback_start_ns;
-    double processing_latency_us = processing_latency_ns / 1e3;  // 마이크로초
-    
-    // 로그 업데이트 (t4 추가)
-    if (publish_time_ns > 0) {
-      int64_t total_latency_ns = callback_start_ns - publish_time_ns;
-      double total_latency_us = total_latency_ns / 1e3;  // 마이크로초
+    if (t1_publish_ns > 1000000000000000000ULL) {
+      double t1_t3_us = (t3_callback_ns - t1_publish_ns) / 1000.0;
+      double t3_t4_us = (t4_send_ns - t3_callback_ns) / 1000.0;
+      double t1_t4_us = (t4_send_ns - t1_publish_ns) / 1000.0;
       
       std::lock_guard<std::mutex> lock(latency_log_mutex);
       if (latency_log_file.is_open()) {
-        latency_log_file << node_id << ","
-                         << msg_counter << ","
-                         << publish_time_ns << ","
-                         << callback_start_ns << ","
-                         << send_complete_ns << ","
-                         << processing_latency_ns << ","
-                         << processing_latency_us << ","
-                         << total_latency_ns << ","
-                         << total_latency_us << "\n";
+        latency_log_file << node_id << "," << msg_counter << ","
+                         << t1_t3_us << "," << t3_t4_us << "," << t1_t4_us << ","
+                         << cpu_total << "," << cpu_gz << "," << cpu_px4 << "," << cpu_mav << "\n";
+        latency_log_file.flush();
       }
     }
   }
